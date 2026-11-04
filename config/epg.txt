@@ -1,3 +1,7 @@
 # 这是EPG订阅列表，用于生成M3U结果频道菜单信息
 # This is the EPG subscription list used to generate M3U result channel menu information
-http://e.erw.cc/e.xml.gz
+
+# 原 e.erw.cc 已失效，使用其社区镜像 | The original e.erw.cc is gone; use its community mirror
+https://gitee.com/taksssss/tv/raw/main/epg/erw.xml.gz
+# 备用：老张 EPG | Fallback: 51zmt EPG
+http://epg.51zmt.top:8000/e.xml

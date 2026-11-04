@@ -49,6 +49,11 @@ segment_sample_limit = 2
 playlist_max_bytes = 2 * 1024 * 1024
 stream_sample_max_bytes = 4 * 1024 * 1024
 stream_sample_max_seconds = 2.0
+playback_segment_limit = 2
+playback_segment_max_bytes = 64 * 1024 * 1024
+playback_edge_max_wait = 8.5
+playback_edge_wait_ratio = 0.8
+playback_timeout_reserve_ratio = 0.1
 
 ad_filter_keywords = [
     "no_signal",
@@ -128,6 +133,73 @@ async def _session(session, concurrency: int = 1):
         return
     async with create_speed_test_session(concurrency) as created_session:
         yield created_session
+
+
+def _deadline_for(timeout: float) -> float:
+    timeout = max(0.5, float(timeout or 0))
+    reserve = min(1.5, max(0.3, timeout * playback_timeout_reserve_ratio))
+    return time() + timeout - reserve
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, deadline - time())
+
+
+def _request_timeout(deadline: float, timeout: float) -> float:
+    return max(0.5, min(float(timeout), _remaining(deadline)))
+
+
+async def get_segment_sample(url: str, headers: dict = None, session: Any = None,
+                             timeout: float = 10.0, semaphore=None,
+                             max_bytes: int = playback_segment_max_bytes,
+                             max_duration: float | None = None) -> dict:
+    """
+    Download one media segment the way a player does, reporting timing and size.
+    """
+    if session is None:
+        session = ClientSession(connector=TCPConnector(ssl=False), trust_env=False)
+        created_session = True
+    else:
+        created_session = False
+    start_time = time()
+    delay = -1
+    total_size = 0
+    completed = False
+    timed_out = False
+    try:
+        async with _limit(semaphore):
+            start_time = time()
+            async with session.get(
+                    url, headers=headers, timeout=ClientTimeout(total=max(0.5, timeout))
+            ) as response:
+                if response.status != 200:
+                    raise Exception("Invalid response")
+                delay = int(round((time() - start_time) * 1000))
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    if not chunk:
+                        continue
+                    total_size += len(chunk)
+                    if total_size >= max_bytes:
+                        break
+                    if max_duration and (time() - start_time) >= max_duration:
+                        timed_out = True
+                        break
+                else:
+                    completed = True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    finally:
+        if created_session:
+            await session.close()
+    return {
+        'delay': delay,
+        'size': total_size,
+        'time': time() - start_time,
+        'completed': completed,
+        'timed_out': timed_out,
+    }
 
 
 async def get_speed_with_download(url: str, headers: dict = None, session: Any = None,
@@ -309,17 +381,231 @@ def _parse_time_to_seconds(t: str) -> float:
         return 0.0
 
 
+def _playlist_uris(playlist) -> tuple:
+    return tuple(
+        segment.uri
+        for segment in (playlist.segments or [])
+        if getattr(segment, "uri", None)
+    )
+
+
+def _newest_segment_url(playlist_url: str, playlist) -> str | None:
+    for segment in reversed(playlist.segments or []):
+        if getattr(segment, "uri", None):
+            return urljoin(playlist_url, segment.uri)
+    return None
+
+
+def _playlist_advanced(initial_playlist, current_playlist) -> bool:
+    initial_sequence = getattr(initial_playlist, "media_sequence", None)
+    current_sequence = getattr(current_playlist, "media_sequence", None)
+    if (
+            isinstance(initial_sequence, int)
+            and isinstance(current_sequence, int)
+            and current_sequence > initial_sequence
+    ):
+        return True
+    initial_uris = _playlist_uris(initial_playlist)
+    current_uris = _playlist_uris(current_playlist)
+    return bool(initial_uris and current_uris) and initial_uris != current_uris
+
+
+async def _check_live_edge(playlist_url: str, initial_playlist, headers: dict,
+                           session, deadline: float, semaphore,
+                           playlist_fetched_at: float) -> dict:
+    """
+    Confirm that a live playlist keeps moving and that its newest segment exists.
+    """
+    if getattr(initial_playlist, "is_endlist", False):
+        return {}
+    playlist_type = str(getattr(initial_playlist, "playlist_type", "") or "").lower()
+    if playlist_type == "vod":
+        return {}
+    segment_durations = [
+        float(segment.duration)
+        for segment in (initial_playlist.segments or [])
+        if getattr(segment, "duration", 0)
+    ]
+    target_duration = max(
+        [float(getattr(initial_playlist, "target_duration", 0) or 0), *segment_durations]
+    )
+    if target_duration <= 0:
+        return {}
+    elapsed_before = max(0.0, time() - playlist_fetched_at)
+    required_span = target_duration * playback_edge_wait_ratio
+    available = _remaining(deadline) - 0.5
+    if elapsed_before < required_span and available < max(0.5, required_span - elapsed_before):
+        return {'live_edge': 'unknown'}
+    max_wait = min(
+        max(0.0, target_duration + 0.5 - elapsed_before),
+        playback_edge_max_wait,
+        max(0.0, available),
+    )
+    poll_interval = min(2.0, max(0.25, target_duration / 3.0))
+    start_time = time()
+    refreshed = False
+    for _ in range(6):
+        if _remaining(deadline) <= 0.3:
+            break
+        content = await get_url_content(
+            playlist_url,
+            headers,
+            session,
+            timeout=min(5.0, _remaining(deadline) - 0.3),
+            semaphore=semaphore,
+        )
+        current_playlist = None
+        if content:
+            try:
+                current_playlist = m3u8.loads(content)
+            except Exception:
+                current_playlist = None
+        if current_playlist is not None:
+            refreshed = True
+            if _playlist_advanced(initial_playlist, current_playlist):
+                result = {'live_edge': 'advanced'}
+                newest_url = _newest_segment_url(playlist_url, current_playlist)
+                probe_budget = _remaining(deadline) - 0.3
+                if newest_url and probe_budget >= 1.0:
+                    probe = await get_segment_sample(
+                        newest_url,
+                        headers,
+                        session,
+                        timeout=min(4.0, probe_budget),
+                        semaphore=semaphore,
+                        max_bytes=64 * 1024,
+                    )
+                    result['newest_segment_ok'] = bool(probe.get('size'))
+                return result
+        elapsed = time() - start_time
+        if elapsed >= max_wait:
+            break
+        await asyncio.sleep(min(poll_interval, max_wait - elapsed))
+    if not refreshed:
+        return {'live_edge': 'unknown'}
+    if elapsed_before + (time() - start_time) >= required_span:
+        return {'live_edge': 'stalled'}
+    return {'live_edge': 'unknown'}
+
+
+async def _measure_playlist_playback(playlist_url: str, playlist, headers: dict,
+                                     session, deadline: float, semaphore,
+                                     playlist_fetched_at: float,
+                                     declared_bitrate=None) -> dict | None:
+    """
+    Measure complete segments from the live edge, like a player filling its buffer.
+    """
+    segments = [
+        segment for segment in (playlist.segments or [])
+        if getattr(segment, "uri", None)
+    ]
+    if not segments:
+        return None
+    candidates = list(reversed(segments[-playback_segment_limit:]))
+    samples = []
+    for segment in candidates:
+        remaining = _remaining(deadline)
+        if remaining <= 0.5:
+            break
+        duration = float(getattr(segment, "duration", 0) or 0)
+        max_duration = max(3.0, duration * 1.3) if duration > 0 else None
+        sample = await get_segment_sample(
+            urljoin(playlist_url, segment.uri),
+            headers,
+            session,
+            timeout=min(remaining, (max_duration or 5.0) + 1.0),
+            semaphore=semaphore,
+            max_duration=max_duration,
+        )
+        sample['duration'] = duration
+        samples.append(sample)
+        if sample['timed_out']:
+            break
+    if not samples:
+        return None
+
+    info: dict = {'playback_checked': True}
+    delays = [sample['delay'] for sample in samples if sample['delay'] >= 0]
+    if delays:
+        info['delay'] = int(sum(delays) / len(delays))
+    total_size = sum(sample['size'] for sample in samples)
+    total_time = sum(sample['time'] for sample in samples if sample['time'] > 0)
+    info['speed'] = total_size / total_time / 1024 / 1024 if total_time > 0 else 0.0
+
+    slow = max(
+        (
+            sample for sample in samples
+            if sample['timed_out'] and sample['duration'] > 0
+        ),
+        key=lambda sample: sample['time'] / sample['duration'],
+        default=None,
+    )
+    if slow is not None:
+        ready_ratio = max(slow['time'] / slow['duration'], 1.3)
+        info['segment_seconds'] = round(slow['duration'], 3)
+        info['segment_download_seconds'] = round(slow['time'], 3)
+        info['segment_ready_ratio'] = round(ready_ratio, 4)
+        info['headroom'] = round(1.0 / ready_ratio, 3)
+        if slow['size'] > 0 and slow['time'] > 0:
+            info['stream_bitrate'] = round(
+                slow['size'] * 8.0 / slow['time'] / 1000.0, 1
+            )
+        return info
+
+    completed = [
+        sample for sample in samples
+        if sample['completed'] and sample['duration'] > 0 and sample['size'] > 0
+    ]
+    if not completed:
+        info['playback_problem'] = 'segment_incomplete'
+        return info
+
+    worst = max(completed, key=lambda sample: sample['time'] / sample['duration'])
+    ready_ratio = worst['time'] / worst['duration']
+    info['segment_seconds'] = round(worst['duration'], 3)
+    info['segment_download_seconds'] = round(worst['time'], 3)
+    info['segment_ready_ratio'] = round(ready_ratio, 4)
+    headrooms = [1.0 / ready_ratio if ready_ratio > 0 else float('inf')]
+    declared = float(declared_bitrate or 0)
+    if declared > 0:
+        segment_bitrates = [
+            sample['size'] * 8.0 / sample['time']
+            for sample in completed
+            if sample['time'] > 0
+        ]
+        if segment_bitrates:
+            headrooms.append(min(segment_bitrates) / declared)
+        info['stream_bitrate'] = round(declared / 1000.0, 1)
+    else:
+        info['stream_bitrate'] = round(worst['size'] * 8.0 / worst['duration'] / 1000.0, 1)
+    info['headroom'] = round(min(headrooms), 3)
+
+    info.update(await _check_live_edge(
+        playlist_url,
+        playlist,
+        headers,
+        session,
+        deadline,
+        semaphore,
+        playlist_fetched_at,
+    ))
+    return info
+
+
 async def get_result(url: str, headers: dict = None, resolution: str = None,
                      filter_resolution: bool = config.open_filter_resolution,
                      timeout: int = speed_test_timeout, session: Any = None,
                      http_semaphore=None, probe_semaphore=None,
-                     redirects_remaining: int = 5) -> dict[str, float | None]:
+                     redirects_remaining: int = 5, deadline: float | None = None) -> dict[str, float | None]:
     """
     Get the test result of the url
     """
     info = {'speed': 0.0, 'delay': -1, 'resolution': resolution}
+    if deadline is None:
+        deadline = _deadline_for(timeout)
     location = None
     segment_urls = []
+    playback_measured = False
     try:
         url = quote(url, safe=':/?$&=@[]%').partition('$')[0]
         async with _session(session) as active_session:
@@ -338,15 +624,24 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
                     http_semaphore=http_semaphore,
                     probe_semaphore=probe_semaphore,
                     redirects_remaining=redirects_remaining - 1,
+                    deadline=deadline,
                 ))
             else:
                 should_parse_m3u8 = ".m3u8" in url.lower() or check_m3u8_valid(res_headers)
                 if should_parse_m3u8:
                     url_content = await get_url_content(
-                        url, headers, active_session, timeout, semaphore=http_semaphore
+                        url,
+                        headers,
+                        active_session,
+                        _request_timeout(deadline, timeout),
+                        semaphore=http_semaphore,
                     )
                 else:
                     url_content = ""
+                media_playlist = None
+                media_playlist_url = None
+                media_playlist_fetched_at = None
+                declared_bitrate = None
                 if should_parse_m3u8 and url_content:
                     m3u8_obj = m3u8.loads(url_content)
                     playlists = m3u8_obj.playlists
@@ -359,27 +654,57 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
                         stream_frame_rate = getattr(best_playlist.stream_info, "frame_rate", None)
                         if stream_frame_rate:
                             info['fps'] = stream_frame_rate
-                        playlist_url = urljoin(url, best_playlist.uri)
+                        declared_bitrate = getattr(best_playlist.stream_info, "bandwidth", None)
+                        media_playlist_url = urljoin(url, best_playlist.uri)
                         playlist_content = await get_url_content(
-                            playlist_url, headers, active_session, timeout, semaphore=http_semaphore
+                            media_playlist_url,
+                            headers,
+                            active_session,
+                            _request_timeout(deadline, timeout),
+                            semaphore=http_semaphore,
                         )
                         if playlist_content:
                             media_playlist = m3u8.loads(playlist_content)
-                            if open_filter_ad and is_ad_playlist(media_playlist, playlist_url):
+                            media_playlist_fetched_at = time()
+                            if open_filter_ad and is_ad_playlist(media_playlist, media_playlist_url):
                                 raise Exception("Ad source filtered")
-                            segment_urls = [urljoin(playlist_url, segment.uri) for segment in media_playlist.segments]
+                            segment_urls = [
+                                urljoin(media_playlist_url, segment.uri)
+                                for segment in media_playlist.segments
+                            ]
                     else:
                         if open_filter_ad and is_ad_playlist(m3u8_obj, url):
                             raise Exception("Ad source filtered")
+                        media_playlist = m3u8_obj
+                        media_playlist_url = url
+                        media_playlist_fetched_at = time()
                         segment_urls = [urljoin(url, segment.uri) for segment in segments]
                     if not segment_urls:
                         raise Exception("Segment urls not found")
                 else:
                     res_info = await get_speed_with_download(
-                        url, headers, active_session, timeout, semaphore=http_semaphore
+                        url,
+                        headers,
+                        active_session,
+                        _request_timeout(deadline, timeout),
+                        semaphore=http_semaphore,
                     )
                     info.update({'speed': res_info['speed'], 'delay': res_info['delay']})
-                if segment_urls:
+                if media_playlist is not None and config.open_playback_check:
+                    playback = await _measure_playlist_playback(
+                        media_playlist_url,
+                        media_playlist,
+                        headers,
+                        active_session,
+                        deadline,
+                        http_semaphore,
+                        media_playlist_fetched_at or time(),
+                        declared_bitrate=declared_bitrate,
+                    )
+                    if playback:
+                        info.update(playback)
+                        playback_measured = True
+                if segment_urls and not playback_measured:
                     sampled_segment_urls = segment_urls[-(segment_sample_limit + 1):-1]
                     if not sampled_segment_urls:
                         sampled_segment_urls = segment_urls[-segment_sample_limit:]
@@ -388,7 +713,7 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
                             ts_url,
                             headers,
                             active_session,
-                            timeout,
+                            _request_timeout(deadline, timeout),
                             semaphore=http_semaphore,
                         )
                         for ts_url in sampled_segment_urls
@@ -412,11 +737,13 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
         default=min_speed_value,
     )
     should_probe = open_supply or not open_filter_speed or (info.get('speed') or 0) >= probe_speed_threshold
+    probe_timeout = min(float(timeout), _remaining(deadline))
     if (filter_resolution and should_probe and not location
-            and not info.get('resolution') and info.get('delay') != -1):
+            and not info.get('resolution') and info.get('delay') != -1
+            and probe_timeout >= 1.0):
         try:
             async with _limit(probe_semaphore):
-                probed = await probe_url(url, headers, timeout=timeout)
+                probed = await probe_url(url, headers, timeout=probe_timeout)
             if probed:
                 info['resolution'] = probed.get('resolution')
                 info['fps'] = probed.get('fps')
@@ -605,7 +932,20 @@ def get_avg_result(result) -> TestResult:
         'delay': int(sum(delays) / len(delays)) if delays else -1,
         'resolution': max(resolutions, key=get_resolution_value) if resolutions else None,
     }
-    for key in ('fps', 'video_codec', 'audio_codec'):
+    for key in (
+            'fps',
+            'video_codec',
+            'audio_codec',
+            'playback_checked',
+            'playback_problem',
+            'headroom',
+            'stream_bitrate',
+            'segment_seconds',
+            'segment_download_seconds',
+            'segment_ready_ratio',
+            'live_edge',
+            'newest_segment_ok',
+    ):
         if best.get(key) is not None:
             averaged[key] = best[key]
     return averaged

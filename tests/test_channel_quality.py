@@ -1,6 +1,7 @@
 import copy
 import os
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from unittest.mock import PropertyMock, patch
@@ -10,7 +11,8 @@ from utils.channel import (
     get_speed_test_status,
     is_valid_speed_result,
 )
-from utils.channel_quality import is_channel_result_valid
+from utils.channel_operations import _as_channel_item
+from utils.channel_quality import channel_result_rejection, is_channel_result_valid
 from utils.channel_repository import (
     _is_valid,
     list_candidate_history,
@@ -22,6 +24,7 @@ from utils.channel_repository import (
     set_channel_selection,
     start_run,
     sync_channel_snapshot,
+    update_result_measurement,
 )
 from utils.config import config
 from utils.identity import stable_channel_id, stable_result_id
@@ -43,7 +46,7 @@ def make_result(*, speed=5.0, delay=10.0, resolution="1920x1080", origin="subscr
 
 
 class ChannelQualityTests(unittest.TestCase):
-    def quality_config(self, *, supply=False):
+    def quality_config(self, *, supply=False, playback=True, playback_headroom=1.5):
         stack = ExitStack()
         values = {
             "open_supply": supply,
@@ -53,6 +56,8 @@ class ChannelQualityTests(unittest.TestCase):
             "open_filter_resolution": True,
             "min_resolution_value": 1280 * 720,
             "max_resolution_value": 1920 * 1080,
+            "open_playback_check": playback,
+            "playback_headroom": playback_headroom,
         }
         for name, value in values.items():
             stack.enter_context(
@@ -233,6 +238,131 @@ class ChannelQualityTests(unittest.TestCase):
             self.assertFalse(is_channel_result_valid(retained))
             self.assertTrue(is_channel_result_valid(retained, retain_special=True))
             self.assertTrue(_is_valid(retained))
+
+    def test_playback_headroom_filters_borderline_sources(self):
+        result = make_result(speed=5.0)
+        result.update({
+            "playback_checked": True,
+            "headroom": 1.2,
+            "segment_ready_ratio": 0.5,
+            "live_edge": "advanced",
+        })
+
+        with self.quality_config(playback_headroom=1.5):
+            self.assertEqual(channel_result_rejection(result), "playback_low_headroom")
+            self.assertFalse(is_valid_speed_result(result))
+            self.assertEqual(get_speed_test_status(result, False), "playback_low_headroom")
+
+        with self.quality_config(playback_headroom=1.1):
+            self.assertTrue(is_valid_speed_result(result))
+
+    def test_slow_segment_ratio_is_rejected_independently_of_stored_headroom(self):
+        result = make_result(speed=5.0)
+        result.update({
+            "playback_checked": True,
+            "headroom": 4.0,
+            "segment_ready_ratio": 1.2,
+            "live_edge": "advanced",
+        })
+
+        with self.quality_config(playback_headroom=1.5):
+            self.assertEqual(channel_result_rejection(result), "playback_low_headroom")
+
+    def test_incomplete_and_stalled_playback_are_rejected(self):
+        incomplete = make_result(speed=5.0)
+        incomplete.update({
+            "playback_checked": True,
+            "playback_problem": "segment_incomplete",
+        })
+        stalled = make_result(speed=5.0)
+        stalled.update({
+            "playback_checked": True,
+            "live_edge": "stalled",
+        })
+
+        with self.quality_config():
+            self.assertEqual(
+                channel_result_rejection(incomplete),
+                "playback_segment_incomplete",
+            )
+            self.assertEqual(
+                channel_result_rejection(stalled),
+                "playback_live_edge_stalled",
+            )
+            self.assertEqual(
+                get_speed_test_status(incomplete, False),
+                "playback_segment_incomplete",
+            )
+
+    def test_playback_fields_are_ignored_when_check_is_disabled(self):
+        result = make_result(speed=5.0)
+        result.update({
+            "playback_checked": True,
+            "headroom": 0.2,
+            "segment_ready_ratio": 5.0,
+            "live_edge": "stalled",
+        })
+
+        with self.quality_config(playback=False):
+            self.assertTrue(is_valid_speed_result(result))
+
+    def test_playback_rejection_survives_repository_round_trip(self):
+        result = make_result(speed=5.0)
+        result.update({
+            "playback_checked": True,
+            "headroom": 0.8,
+            "segment_ready_ratio": 1.2,
+            "segment_seconds": 4.0,
+            "segment_download_seconds": 4.8,
+            "live_edge": "advanced",
+            "test_status": "measured",
+            "tested_at": time.time(),
+        })
+        data = {"News": {"Demo": [result]}}
+
+        with self.quality_config(playback_headroom=1.5), tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "channels.db")
+            sync_channel_snapshot(db_path, data, tested_data=data)
+            rows = list_channel_results(db_path, stable_channel_id("News", "Demo"))
+
+            self.assertFalse(rows[0]["valid"])
+            restored = _as_channel_item(rows[0])
+            self.assertEqual(
+                channel_result_rejection(restored),
+                "playback_low_headroom",
+            )
+
+    def test_retest_measurement_persists_playback_fields(self):
+        result = make_result(speed=5.0)
+        result.update({"test_status": "measured", "tested_at": time.time()})
+        data = {"News": {"Demo": [result]}}
+
+        with self.quality_config(playback_headroom=1.5), tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "channels.db")
+            channel_key = stable_channel_id("News", "Demo")
+            sync_channel_snapshot(db_path, data, tested_data=data)
+            update_result_measurement(
+                db_path,
+                channel_key,
+                result["id"],
+                {
+                    **result,
+                    "playback_checked": True,
+                    "headroom": 0.6,
+                    "segment_ready_ratio": 1.4,
+                    "live_edge": "advanced",
+                },
+            )
+            rows = list_channel_results(db_path, channel_key)
+
+            self.assertFalse(rows[0]["valid"])
+            restored = _as_channel_item(rows[0])
+            self.assertEqual(restored["headroom"], 0.6)
+            self.assertEqual(restored["live_edge"], "advanced")
+            self.assertEqual(
+                channel_result_rejection(restored),
+                "playback_low_headroom",
+            )
 
 
 if __name__ == "__main__":

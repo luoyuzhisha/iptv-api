@@ -23,6 +23,11 @@ from utils.speed import get_speed, invalidate_speed_cache
 
 def _as_channel_item(row: dict) -> dict:
     extra = row.get("extra_data") or {}
+    if not isinstance(extra, dict):
+        extra = {}
+    playback = extra.get("playback")
+    if not isinstance(playback, dict):
+        playback = {}
     return {
         "id": row["result_key"],
         "url": row["url"],
@@ -43,6 +48,15 @@ def _as_channel_item(row: dict) -> dict:
         "catchup": extra.get("catchup"),
         "tvg_logo": extra.get("tvg_logo"),
         "extra_info": extra.get("extra_info") or "",
+        "playback_checked": playback.get("playback_checked"),
+        "playback_problem": playback.get("playback_problem"),
+        "headroom": playback.get("headroom"),
+        "stream_bitrate": playback.get("stream_bitrate"),
+        "segment_seconds": playback.get("segment_seconds"),
+        "segment_download_seconds": playback.get("segment_download_seconds"),
+        "segment_ready_ratio": playback.get("segment_ready_ratio"),
+        "live_edge": playback.get("live_edge"),
+        "newest_segment_ok": playback.get("newest_segment_ok"),
     }
 
 

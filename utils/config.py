@@ -67,6 +67,7 @@ BOOLEAN_KEYS = {
     "open_history",
     "open_local",
     "open_m3u_result",
+    "open_playback_check",
     "open_request",
     "open_realtime_write",
     "open_rtmp",
@@ -109,6 +110,7 @@ CONFIG_SCHEMA = {
     "rtmp_idle_timeout": ConfigRule(kind="integer", minimum=0),
     "rtmp_max_streams": ConfigRule(kind="integer", minimum=1),
     "min_speed": ConfigRule(kind="float", minimum=0),
+    "playback_headroom": ConfigRule(kind="float", minimum=0.5, maximum=5),
     "update_interval": ConfigRule(kind="float", minimum=0, allow_empty=True),
     "update_time_position": ConfigRule(kind="enum", choices=("top", "bottom")),
     "language": ConfigRule(kind="enum", choices=("zh_CN", "en")),
@@ -342,6 +344,20 @@ class ConfigManager:
         return self.config.getfloat("Settings", "min_speed", fallback=0.5)
 
     @property
+    def open_playback_check(self):
+        return self.config.getboolean(
+            "Settings", "open_playback_check", fallback=True
+        )
+
+    @property
+    def playback_headroom(self):
+        try:
+            value = self.config.getfloat("Settings", "playback_headroom", fallback=1.5)
+        except (TypeError, ValueError):
+            return 1.5
+        return value if value > 0 else 1.5
+
+    @property
     def min_resolution(self):
         return self.config.get("Settings", "min_resolution", fallback="1920x1080")
 
@@ -478,7 +494,7 @@ class ConfigManager:
 
     @property
     def speed_test_timeout(self):
-        return self.config.getint("Settings", "speed_test_timeout", fallback=10)
+        return self.config.getint("Settings", "speed_test_timeout", fallback=15)
 
     @property
     def open_empty_category(self):

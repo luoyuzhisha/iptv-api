@@ -772,7 +772,13 @@ class UpdateSource:
                         t("summary.filtered"),
                         sum(
                             self.run_metrics.get("status_counts", {}).get(key, 0)
-                            for key in ("filtered_speed", "filtered_resolution")
+                            for key in (
+                                "filtered_speed",
+                                "filtered_resolution",
+                                "playback_low_headroom",
+                                "playback_segment_incomplete",
+                                "playback_live_edge_stalled",
+                            )
                         ),
                     ),
                     (t("summary.skipped"), self.run_metrics.get("skipped", 0)),

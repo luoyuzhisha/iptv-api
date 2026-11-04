@@ -6,6 +6,36 @@ from utils.config import config, get_resolution_value
 RETAIN_ORIGINS = frozenset({"whitelist", "hls"})
 
 
+def _playback_rejection(item: dict, headroom: float) -> str | None:
+    """Return why the measured playback does not sustain real-time delivery."""
+    if not config.open_playback_check or not item.get("playback_checked"):
+        return None
+    if not isinstance(headroom, (int, float)) or headroom <= 0:
+        return None
+    if item.get("playback_problem") == "segment_incomplete":
+        return "playback_segment_incomplete"
+    if item.get("live_edge") == "stalled":
+        return "playback_live_edge_stalled"
+    ready_ratio = item.get("segment_ready_ratio")
+    if (
+        isinstance(ready_ratio, (int, float))
+        and not isinstance(ready_ratio, bool)
+        and math.isfinite(ready_ratio)
+        and ready_ratio > 0
+        and ready_ratio > 1.0 / headroom
+    ):
+        return "playback_low_headroom"
+    measured_headroom = item.get("headroom")
+    if (
+        isinstance(measured_headroom, (int, float))
+        and not isinstance(measured_headroom, bool)
+        and math.isfinite(measured_headroom)
+        and measured_headroom < headroom
+    ):
+        return "playback_low_headroom"
+    return None
+
+
 def channel_result_rejection(
         item: dict,
         *,
@@ -17,6 +47,7 @@ def channel_result_rejection(
         filter_resolution: bool | None = None,
         min_resolution: int | None = None,
         max_resolution: int | None = None,
+        playback_headroom: float | None = None,
 ) -> str | None:
     """Return the reason a measured channel result is not playable."""
     if retain_special and item.get("origin") in RETAIN_ORIGINS:
@@ -39,6 +70,15 @@ def channel_result_rejection(
     supply = config.open_supply if supply is None else supply
     if supply:
         return None
+
+    playback_headroom_value = (
+        config.playback_headroom
+        if playback_headroom is None
+        else playback_headroom
+    )
+    playback_rejection = _playback_rejection(item, playback_headroom_value)
+    if playback_rejection:
+        return playback_rejection
 
     filter_speed = config.open_filter_speed if filter_speed is None else filter_speed
     min_speed = config.min_speed if min_speed is None else min_speed

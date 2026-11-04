@@ -40,6 +40,15 @@ class TestResult(TypedDict):
     video_codec: NotRequired[str | None]
     audio_codec: NotRequired[str | None]
     fps: NotRequired[float | None]
+    playback_checked: NotRequired[bool]
+    playback_problem: NotRequired[str | None]
+    headroom: NotRequired[float | None]
+    stream_bitrate: NotRequired[float | None]
+    segment_seconds: NotRequired[float | None]
+    segment_download_seconds: NotRequired[float | None]
+    segment_ready_ratio: NotRequired[float | None]
+    live_edge: NotRequired[str | None]
+    newest_segment_ok: NotRequired[bool]
 
 
 TestResultCacheData = dict[str, list[TestResult]]

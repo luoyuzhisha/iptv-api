@@ -306,6 +306,49 @@ def _is_valid(item: dict) -> bool:
     return is_channel_result_valid(item, retain_special=True)
 
 
+PLAYBACK_FIELDS = (
+    "playback_checked",
+    "playback_problem",
+    "headroom",
+    "stream_bitrate",
+    "segment_seconds",
+    "segment_download_seconds",
+    "segment_ready_ratio",
+    "live_edge",
+    "newest_segment_ok",
+)
+
+
+def _playback_measurement(item: dict) -> dict:
+    """Return the playback diagnostics that must survive a database round trip."""
+    return {key: item[key] for key in PLAYBACK_FIELDS if item.get(key) is not None}
+
+
+def _store_playback_measurement(conn, channel_key: str, result_key: str, playback: dict) -> None:
+    row = conn.execute(
+        "SELECT extra_data FROM channel_results WHERE channel_key=? AND result_key=?",
+        (channel_key, result_key),
+    ).fetchone()
+    try:
+        extra_data = json.loads(row[0]) if row and row[0] else {}
+    except (TypeError, ValueError):
+        extra_data = {}
+    if not isinstance(extra_data, dict):
+        extra_data = {}
+    if playback:
+        extra_data["playback"] = playback
+    else:
+        extra_data.pop("playback", None)
+    conn.execute(
+        "UPDATE channel_results SET extra_data=? WHERE channel_key=? AND result_key=?",
+        (
+            json.dumps(extra_data, ensure_ascii=False, sort_keys=True),
+            channel_key,
+            result_key,
+        ),
+    )
+
+
 def _is_measured_valid(item: dict) -> bool:
     """A candidate is valid only after measurement, except retained sources."""
     return _is_valid(item) and (
@@ -467,6 +510,9 @@ def sync_channel_snapshot(
                     "tvg_logo": item.get("tvg_logo"),
                     "extra_info": item.get("extra_info"),
                 }
+                playback = _playback_measurement(item)
+                if playback:
+                    extra_data["playback"] = playback
                 result_rows.append((
                     channel_key,
                     item["result_key"],
@@ -1191,6 +1237,12 @@ def update_result_measurement(db_path: str, channel_key: str, result_key: str, m
                 """,
                 values,
             )
+            _store_playback_measurement(
+                conn,
+                channel_key,
+                result_key,
+                _playback_measurement(measurement),
+            )
             latest_run = conn.execute(
                 "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1"
             ).fetchone()
@@ -1389,7 +1441,12 @@ def load_selected_snapshot(db_path: str) -> dict:
             row = dict(raw)
             row["id"] = row["result_key"]
             row["headers"] = json.loads(row["headers"]) if row.get("headers") else None
-            row.update(json.loads(row["extra_data"]) if row.get("extra_data") else {})
+            extra_data = json.loads(row["extra_data"]) if row.get("extra_data") else {}
+            if isinstance(extra_data, dict):
+                playback = extra_data.pop("playback", None)
+                row.update(extra_data)
+                if isinstance(playback, dict):
+                    row.update(playback)
             result.setdefault(row["category"], {}).setdefault(row["name"], []).append(row)
         return result
     finally:

@@ -858,6 +858,10 @@ def build_speed_test_record(cate, name, merged, is_valid, run_id=None):
         "error_type": merged.get("error_type"),
         "status": get_speed_test_status(merged, is_valid),
         "valid": is_valid,
+        "headroom": merged.get("headroom"),
+        "segment_seconds": merged.get("segment_seconds"),
+        "segment_download_seconds": merged.get("segment_download_seconds"),
+        "live_edge": merged.get("live_edge"),
     }
 
 

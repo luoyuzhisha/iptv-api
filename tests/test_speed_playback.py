@@ -19,8 +19,6 @@ class HlsFixture:
             advance=None,
             master_bandwidth=None,
             endlist=False,
-            redirect=False,
-            redirect_get_only=False,
     ):
         self.segment_size = segment_size
         self.segment_delay = segment_delay
@@ -29,8 +27,6 @@ class HlsFixture:
         self.advance = advance
         self.master_bandwidth = master_bandwidth
         self.endlist = endlist
-        self.redirect = redirect
-        self.redirect_get_only = redirect_get_only
         self.sequence = 10
         self.server = None
         self.port = None
@@ -99,21 +95,6 @@ class HlsFixture:
             method = parts[0].decode("ascii", "ignore")
             path = parts[1].decode("ascii", "ignore").split("?", 1)[0]
             if path.endswith(".m3u8"):
-                redirect_now = (
-                    path != "/redirected.m3u8"
-                    and (self.redirect or self.redirect_get_only)
-                    and (not self.redirect_get_only or method == "GET")
-                )
-                if redirect_now:
-                    await self._respond(
-                        writer,
-                        method,
-                        b"",
-                        "text/plain",
-                        status="302 Found",
-                        extra_headers={"Location": "/redirected.m3u8"},
-                    )
-                    return
                 body = self._master() if path.endswith("master.m3u8") else self._playlist()
                 content_type = "application/vnd.apple.mpegurl"
                 await self._respond(writer, method, body, content_type)
@@ -138,16 +119,13 @@ class HlsFixture:
             except Exception:
                 pass
 
-    async def _respond(self, writer, method, body, content_type, status="200 OK",
-                       extra_headers=None):
-        header_lines = [
-            f"HTTP/1.1 {status}",
-            f"Content-Type: {content_type}",
-            f"Content-Length: {len(body)}",
-            *[f"{key}: {value}" for key, value in (extra_headers or {}).items()],
-            "Connection: close",
-        ]
-        headers = ("\r\n".join(header_lines) + "\r\n\r\n").encode()
+    async def _respond(self, writer, method, body, content_type, status="200 OK"):
+        headers = (
+            f"HTTP/1.1 {status}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
         writer.write(headers)
         if method != "HEAD":
             writer.write(body)
@@ -155,15 +133,10 @@ class HlsFixture:
 
 
 @contextmanager
-def playback_config(headroom=1.5, enabled=True, redirect_enabled=True):
+def playback_config(headroom=1.5, enabled=True):
     with (
         patch.object(
             type(config), "open_playback_check", new=PropertyMock(return_value=enabled)
-        ),
-        patch.object(
-            type(config),
-            "open_playback_redirect_check",
-            new=PropertyMock(return_value=redirect_enabled),
         ),
         patch.object(
             type(config), "playback_headroom", new=PropertyMock(return_value=headroom)
@@ -203,66 +176,6 @@ class HlsPlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(result["segment_ready_ratio"], 0.5)
         self.assertGreaterEqual(result["headroom"], 1.5)
         self.assertGreater(result["speed"], 0)
-
-    async def test_redirected_playlist_is_rejected(self):
-        fixture = await self.start_fixture(advance=0.1, redirect=True)
-
-        with playback_config(headroom=1.5):
-            result = await get_result(fixture.url(), filter_resolution=False, timeout=8)
-            self.assertTrue(result["playback_redirected"])
-            self.assertEqual(
-                result["playback_redirect_target"],
-                f"http://127.0.0.1:{fixture.port}/redirected.m3u8",
-            )
-            self.assertFalse(is_channel_result_valid(
-                result,
-                filter_speed=False,
-                filter_resolution=False,
-            ))
-            self.assertEqual(
-                channel_result_rejection(
-                    result,
-                    filter_speed=False,
-                    filter_resolution=False,
-                ),
-                "playback_redirected",
-            )
-
-    async def test_redirected_playlist_allowed_when_disabled(self):
-        fixture = await self.start_fixture(advance=0.1, redirect=True)
-
-        with playback_config(headroom=1.5, redirect_enabled=False):
-            result = await get_result(fixture.url(), filter_resolution=False, timeout=8)
-            self.assertTrue(result["playback_redirected"])
-            self.assertTrue(is_channel_result_valid(
-                result,
-                filter_speed=False,
-                filter_resolution=False,
-            ))
-
-    async def test_get_only_redirect_allowed_when_disabled(self):
-        fixture = await self.start_fixture(advance=0.1, redirect_get_only=True)
-
-        with playback_config(headroom=1.5, redirect_enabled=False):
-            result = await get_result(fixture.url(), filter_resolution=False, timeout=8)
-            self.assertTrue(result["playback_redirected"])
-            self.assertTrue(is_channel_result_valid(
-                result,
-                filter_speed=False,
-                filter_resolution=False,
-            ))
-
-    async def test_get_only_redirect_is_rejected(self):
-        fixture = await self.start_fixture(advance=0.1, redirect_get_only=True)
-
-        with playback_config(headroom=1.5):
-            result = await get_result(fixture.url(), filter_resolution=False, timeout=8)
-            self.assertTrue(result["playback_redirected"])
-            self.assertFalse(is_channel_result_valid(
-                result,
-                filter_speed=False,
-                filter_resolution=False,
-            ))
 
     async def test_segment_slower_than_its_duration_reduces_headroom(self):
         fixture = await self.start_fixture(
@@ -377,23 +290,6 @@ class PlaybackResultTests(unittest.TestCase):
         self.assertEqual(averaged["headroom"], 2.2)
         self.assertEqual(averaged["segment_ready_ratio"], 0.4)
         self.assertEqual(averaged["live_edge"], "advanced")
-
-    def test_average_result_keeps_redirect_fields(self):
-        averaged = get_avg_result([
-            {
-                "speed": 2.0,
-                "delay": 10,
-                "playback_redirected": True,
-                "playback_redirect_target": "http://example.com/live.m3u8",
-            },
-            {"speed": 1.0, "delay": 20},
-        ])
-
-        self.assertTrue(averaged["playback_redirected"])
-        self.assertEqual(
-            averaged["playback_redirect_target"],
-            "http://example.com/live.m3u8",
-        )
 
 
 if __name__ == "__main__":

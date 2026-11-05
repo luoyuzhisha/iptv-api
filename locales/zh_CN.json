@@ -757,7 +757,6 @@
   "status.playback_low_headroom": "播放余量不足",
   "status.playback_segment_incomplete": "分片下载不完整",
   "status.playback_live_edge_stalled": "直播未推进",
-  "status.playback_redirected": "播放地址跳转",
   "status.measured": "已测速",
   "status.unreachable": "不可用",
   "status.cancelled": "已取消",

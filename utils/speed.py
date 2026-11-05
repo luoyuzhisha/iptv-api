@@ -309,8 +309,7 @@ async def get_headers(url: str, headers: dict = None, session: Any = None, timeo
 
 
 async def get_url_content(url: str, headers: dict = None, session: Any = None,
-                          timeout: int = speed_test_timeout, semaphore=None,
-                          redirect_info: dict | None = None) -> str:
+                          timeout: int = speed_test_timeout, semaphore=None) -> str:
     """
     Get the content of the url
     """
@@ -323,9 +322,6 @@ async def get_url_content(url: str, headers: dict = None, session: Any = None,
     try:
         async with _limit(semaphore):
             async with session.get(url, headers=headers, timeout=timeout) as response:
-                if redirect_info is not None and response.history:
-                    redirect_info["redirected"] = True
-                    redirect_info["redirect_target"] = str(response.url)
                 if response.status == 200:
                     payload = await response.content.read(playlist_max_bytes + 1)
                     if len(payload) > playlist_max_bytes:
@@ -610,7 +606,6 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
     location = None
     segment_urls = []
     playback_measured = False
-    playback_redirect: dict = {}
     try:
         url = quote(url, safe=':/?$&=@[]%').partition('$')[0]
         async with _session(session) as active_session:
@@ -619,7 +614,7 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
             if location:
                 if redirects_remaining <= 0:
                     raise Exception("Too many redirects")
-                redirected_info = await get_result(
+                info.update(await get_result(
                     urljoin(url, location),
                     headers,
                     resolution,
@@ -630,18 +625,7 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
                     probe_semaphore=probe_semaphore,
                     redirects_remaining=redirects_remaining - 1,
                     deadline=deadline,
-                )
-                info.update(redirected_info)
-                if (
-                    ".m3u8" in url.lower()
-                    or redirected_info.get("playback_checked")
-                    or redirected_info.get("playback_redirected")
-                ):
-                    info["playback_redirected"] = True
-                    info.setdefault(
-                        "playback_redirect_target",
-                        urljoin(url, location),
-                    )
+                ))
             else:
                 should_parse_m3u8 = ".m3u8" in url.lower() or check_m3u8_valid(res_headers)
                 if should_parse_m3u8:
@@ -651,7 +635,6 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
                         active_session,
                         _request_timeout(deadline, timeout),
                         semaphore=http_semaphore,
-                        redirect_info=playback_redirect,
                     )
                 else:
                     url_content = ""
@@ -679,7 +662,6 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
                             active_session,
                             _request_timeout(deadline, timeout),
                             semaphore=http_semaphore,
-                            redirect_info=playback_redirect,
                         )
                         if playlist_content:
                             media_playlist = m3u8.loads(playlist_content)
@@ -708,19 +690,7 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
                         semaphore=http_semaphore,
                     )
                     info.update({'speed': res_info['speed'], 'delay': res_info['delay']})
-                if playback_redirect.get("redirected"):
-                    info["playback_redirected"] = True
-                    info.setdefault(
-                        "playback_redirect_target",
-                        playback_redirect.get("redirect_target"),
-                    )
-                redirect_rejected = (
-                    bool(info.get("playback_redirected"))
-                    and config.open_playback_check
-                    and config.open_playback_redirect_check
-                )
-                if (media_playlist is not None and config.open_playback_check
-                        and not redirect_rejected):
+                if media_playlist is not None and config.open_playback_check:
                     playback = await _measure_playlist_playback(
                         media_playlist_url,
                         media_playlist,
@@ -734,8 +704,7 @@ async def get_result(url: str, headers: dict = None, resolution: str = None,
                     if playback:
                         info.update(playback)
                         playback_measured = True
-                if (segment_urls and not playback_measured
-                        and not redirect_rejected):
+                if segment_urls and not playback_measured:
                     sampled_segment_urls = segment_urls[-(segment_sample_limit + 1):-1]
                     if not sampled_segment_urls:
                         sampled_segment_urls = segment_urls[-segment_sample_limit:]
@@ -963,13 +932,6 @@ def get_avg_result(result) -> TestResult:
         'delay': int(sum(delays) / len(delays)) if delays else -1,
         'resolution': max(resolutions, key=get_resolution_value) if resolutions else None,
     }
-    redirected = next(
-        (item for item in result if item.get('playback_redirected')),
-        None,
-    )
-    if redirected is not None:
-        averaged['playback_redirected'] = True
-        averaged['playback_redirect_target'] = redirected.get('playback_redirect_target')
     for key in (
             'fps',
             'video_codec',

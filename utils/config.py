@@ -68,7 +68,6 @@ BOOLEAN_KEYS = {
     "open_local",
     "open_m3u_result",
     "open_playback_check",
-    "open_playback_redirect_check",
     "open_request",
     "open_realtime_write",
     "open_rtmp",
@@ -348,12 +347,6 @@ class ConfigManager:
     def open_playback_check(self):
         return self.config.getboolean(
             "Settings", "open_playback_check", fallback=True
-        )
-
-    @property
-    def open_playback_redirect_check(self):
-        return self.config.getboolean(
-            "Settings", "open_playback_redirect_check", fallback=True
         )
 
     @property

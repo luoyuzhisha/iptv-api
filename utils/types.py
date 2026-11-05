@@ -42,8 +42,6 @@ class TestResult(TypedDict):
     fps: NotRequired[float | None]
     playback_checked: NotRequired[bool]
     playback_problem: NotRequired[str | None]
-    playback_redirected: NotRequired[bool]
-    playback_redirect_target: NotRequired[str | None]
     headroom: NotRequired[float | None]
     stream_bitrate: NotRequired[float | None]
     segment_seconds: NotRequired[float | None]

@@ -309,8 +309,6 @@ def _is_valid(item: dict) -> bool:
 PLAYBACK_FIELDS = (
     "playback_checked",
     "playback_problem",
-    "playback_redirected",
-    "playback_redirect_target",
     "headroom",
     "stream_bitrate",
     "segment_seconds",

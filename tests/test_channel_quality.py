@@ -46,9 +46,7 @@ def make_result(*, speed=5.0, delay=10.0, resolution="1920x1080", origin="subscr
 
 
 class ChannelQualityTests(unittest.TestCase):
-    def quality_config(
-            self, *, supply=False, playback=True, playback_headroom=1.5,
-            playback_redirect=True):
+    def quality_config(self, *, supply=False, playback=True, playback_headroom=1.5):
         stack = ExitStack()
         values = {
             "open_supply": supply,
@@ -59,7 +57,6 @@ class ChannelQualityTests(unittest.TestCase):
             "min_resolution_value": 1280 * 720,
             "max_resolution_value": 1920 * 1080,
             "open_playback_check": playback,
-            "open_playback_redirect_check": playback_redirect,
             "playback_headroom": playback_headroom,
         }
         for name, value in values.items():
@@ -258,43 +255,6 @@ class ChannelQualityTests(unittest.TestCase):
 
         with self.quality_config(playback_headroom=1.1):
             self.assertTrue(is_valid_speed_result(result))
-
-    def test_redirected_playback_is_rejected(self):
-        item = make_result()
-        item.update({
-            "playback_checked": True,
-            "playback_redirected": True,
-            "headroom": 5.0,
-        })
-        with self.quality_config():
-            self.assertFalse(is_channel_result_valid(
-                item,
-                filter_speed=False,
-                filter_resolution=False,
-            ))
-            self.assertEqual(
-                channel_result_rejection(
-                    item,
-                    filter_speed=False,
-                    filter_resolution=False,
-                ),
-                "playback_redirected",
-            )
-            self.assertEqual(get_speed_test_status(item, False), "playback_redirected")
-
-    def test_redirected_playback_is_allowed_when_check_is_disabled(self):
-        item = make_result()
-        item.update({
-            "playback_checked": True,
-            "playback_redirected": True,
-            "headroom": 5.0,
-        })
-        with self.quality_config(playback_redirect=False):
-            self.assertTrue(is_channel_result_valid(
-                item,
-                filter_speed=False,
-                filter_resolution=False,
-            ))
 
     def test_slow_segment_ratio_is_rejected_independently_of_stored_headroom(self):
         result = make_result(speed=5.0)

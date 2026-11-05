@@ -778,7 +778,6 @@ class UpdateSource:
                                 "playback_low_headroom",
                                 "playback_segment_incomplete",
                                 "playback_live_edge_stalled",
-                                "playback_redirected",
                             )
                         ),
                     ),

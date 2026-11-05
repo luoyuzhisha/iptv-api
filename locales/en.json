@@ -758,7 +758,6 @@
   "status.playback_low_headroom": "insufficient playback headroom",
   "status.playback_segment_incomplete": "incomplete segment download",
   "status.playback_live_edge_stalled": "live edge not advancing",
-  "status.playback_redirected": "playlist URL redirected",
   "status.measured": "measured",
   "status.unreachable": "unavailable",
   "status.cancelled": "cancelled",

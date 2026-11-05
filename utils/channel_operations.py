@@ -50,6 +50,8 @@ def _as_channel_item(row: dict) -> dict:
         "extra_info": extra.get("extra_info") or "",
         "playback_checked": playback.get("playback_checked"),
         "playback_problem": playback.get("playback_problem"),
+        "playback_redirected": playback.get("playback_redirected"),
+        "playback_redirect_target": playback.get("playback_redirect_target"),
         "headroom": playback.get("headroom"),
         "stream_bitrate": playback.get("stream_bitrate"),
         "segment_seconds": playback.get("segment_seconds"),

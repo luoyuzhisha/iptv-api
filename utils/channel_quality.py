@@ -8,7 +8,11 @@ RETAIN_ORIGINS = frozenset({"whitelist", "hls"})
 
 def _playback_rejection(item: dict, headroom: float) -> str | None:
     """Return why the measured playback does not sustain real-time delivery."""
-    if not config.open_playback_check or not item.get("playback_checked"):
+    if not config.open_playback_check:
+        return None
+    if config.open_playback_redirect_check and item.get("playback_redirected"):
+        return "playback_redirected"
+    if not item.get("playback_checked"):
         return None
     if not isinstance(headroom, (int, float)) or headroom <= 0:
         return None
@@ -53,6 +57,15 @@ def channel_result_rejection(
     if retain_special and item.get("origin") in RETAIN_ORIGINS:
         return None
 
+    supply_mode = config.open_supply if supply is None else supply
+    if (
+        not supply_mode
+        and config.open_playback_check
+        and config.open_playback_redirect_check
+        and item.get("playback_redirected")
+    ):
+        return "playback_redirected"
+
     speed = item.get("speed")
     delay = item.get("delay")
     if (
@@ -67,8 +80,7 @@ def channel_result_rejection(
     ):
         return "unreachable"
 
-    supply = config.open_supply if supply is None else supply
-    if supply:
+    if supply_mode:
         return None
 
     playback_headroom_value = (

@@ -809,6 +809,12 @@ def get_speed_test_status(info, is_valid: bool) -> str:
         return status
     if is_valid:
         return "valid"
+    if (
+        info.get("playback_redirected")
+        and config.open_playback_check
+        and config.open_playback_redirect_check
+    ):
+        return "playback_redirected"
     delay = info.get("delay")
     speed = info.get("speed") or 0
     if delay is None or delay == -1 or not speed:
@@ -862,6 +868,8 @@ def build_speed_test_record(cate, name, merged, is_valid, run_id=None):
         "segment_seconds": merged.get("segment_seconds"),
         "segment_download_seconds": merged.get("segment_download_seconds"),
         "live_edge": merged.get("live_edge"),
+        "redirected": merged.get("playback_redirected"),
+        "redirect_target": merged.get("playback_redirect_target"),
     }
 
 

@@ -7,7 +7,7 @@ import os
 import pickle
 import re
 import tempfile
-from collections import defaultdict, Counter, OrderedDict
+from collections import defaultdict, Counter, OrderedDict, deque
 from itertools import chain
 from typing import cast
 
@@ -28,7 +28,9 @@ from utils.speed import (
     create_speed_test_session,
     get_speed,
     get_speed_result,
-    get_sort_result
+    get_sort_result,
+    get_url_origin,
+    resolve_origin,
 )
 from utils.tools import (
     format_name,
@@ -979,123 +981,167 @@ async def test_speed(
                     info['name'] = name
                     yield cate, name, info
 
-    item_iterator = iter(iter_items())
+    items = list(iter_items())
     skipped = 0
+
+    async def build_origin_lanes(session):
+        """Group candidates by media origin so same-origin tests never overlap."""
+        host_counts = Counter(
+            info.get("host") or get_url_origin(info.get("url") or "")
+            for _, _, info in items
+        )
+        resolve_semaphore = asyncio.Semaphore(max(1, concurrency))
+        resolve_timeout = min(1.0, max(0.5, float(config.speed_test_timeout) / 10))
+        resolved = {}
+
+        async def origin_of(info):
+            if pause_wait:
+                await pause_wait()
+            url = info.get("url") or ""
+            host = info.get("host") or get_url_origin(url) or ""
+            if (
+                not url
+                or host_counts.get(host, 0) < 2
+                or constants.rt_url_pattern.match(url) is not None
+                or (ipv6_proxy_url and info.get("ipv_type") == "ipv6")
+            ):
+                return host
+            if url not in resolved:
+                resolved[url] = await resolve_origin(
+                    url,
+                    headers=info.get("headers") or None,
+                    session=session,
+                    timeout=resolve_timeout,
+                    semaphore=resolve_semaphore,
+                )
+            return resolved[url] or host
+
+        origins = await asyncio.gather(*(origin_of(info) for _, _, info in items))
+        lanes = {}
+        for (cate, name, info), origin in zip(items, origins):
+            lanes.setdefault(origin, []).append((cate, name, info))
+        return list(lanes.values())
 
     try:
         async with create_speed_test_session(concurrency) as session:
+            lane_queue = deque(await build_origin_lanes(session))
+
             async def worker():
                 nonlocal skipped
                 while True:
                     if pause_wait:
                         await pause_wait()
-                    try:
-                        cate, name, info = next(item_iterator)
-                    except StopIteration:
+                    if not lane_queue:
                         return
-
-                    if (cate, name) in stopped_channels:
-                        skipped += 1
-                        continue
-                    result = {}
-                    try:
-                        async with asyncio.timeout(config.speed_test_timeout):
-                            result = await get_speed(
-                                info,
-                                headers=info.get("headers") or None,
-                                ipv6_proxy=ipv6_proxy_url,
-                                filter_resolution=get_resolution,
-                                timeout=config.speed_test_timeout,
-                                session=session,
-                                http_semaphore=http_semaphore,
-                                probe_semaphore=probe_semaphore,
-                            )
-                    except asyncio.CancelledError:
-                        task = asyncio.current_task()
-                        if task is not None and task.cancelling():
-                            raise
-                        result = {
-                            "speed": 0,
-                            "delay": -1,
-                            "resolution": None,
-                            "fps": None,
-                            "video_codec": None,
-                            "audio_codec": None,
-                            "test_status": "request_error",
-                            "error_type": "CancelledError",
-                        }
-                    except TimeoutError:
-                        result = {
-                            "speed": 0,
-                            "delay": -1,
-                            "resolution": None,
-                            "fps": None,
-                            "video_codec": None,
-                            "audio_codec": None,
-                            "test_status": "timeout",
-                        }
-                    except Exception as exc:
-                        result = {
-                            "speed": 0,
-                            "delay": -1,
-                            "resolution": None,
-                            "fps": None,
-                            "video_codec": None,
-                            "audio_codec": None,
-                            "test_status": "request_error",
-                            "error_type": type(exc).__name__,
-                        }
-                    speed_value = result.get("speed") or 0
-                    delay_value = result.get("delay")
-                    if (
-                        capture_screenshots
-                        and delay_value not in {-1, None}
-                        and isinstance(speed_value, (int, float))
-                        and speed_value >= screenshot_speed_threshold
-                        and not math.isinf(speed_value)
-                    ):
-                        result_key = info.get("id") or stable_result_id(
-                            info.get("url", ""),
-                            info.get("headers"),
-                        )
+                    lane = lane_queue.popleft()
+                    for cate, name, info in lane:
+                        if pause_wait:
+                            await pause_wait()
+                        if (cate, name) in stopped_channels:
+                            skipped += 1
+                            continue
+                        result = {}
                         try:
-                            async with screenshot_semaphore:
-                                screenshot = await capture_stream_screenshot(
-                                    info.get("url", "").partition("$")[0],
-                                    result_key,
-                                    constants.screenshot_dir,
-                                    headers={
-                                        **request_headers,
-                                        **(info.get("headers") or {}),
-                                    },
-                                    timeout=config.stream_screenshot_timeout,
-                                    width=config.stream_screenshot_width,
-                                )
-                            await asyncio.to_thread(
-                                upsert_stream_screenshot,
-                                constants.channel_results_path,
-                                screenshot,
-                            )
-                            if screenshot.get("status") == "success":
-                                for key in (
-                                    "resolution",
-                                    "fps",
-                                    "video_codec",
-                                    "audio_codec",
-                                ):
-                                    if screenshot.get(key) is not None:
-                                        result[key] = screenshot[key]
+                            # A lane is exclusive per origin and the slot is
+                            # taken before the timer, so queueing never eats
+                            # into the per-URL budget.
+                            async with http_semaphore:
+                                async with asyncio.timeout(config.speed_test_timeout):
+                                    result = await get_speed(
+                                        info,
+                                        headers=info.get("headers") or None,
+                                        ipv6_proxy=ipv6_proxy_url,
+                                        filter_resolution=get_resolution,
+                                        timeout=config.speed_test_timeout,
+                                        session=session,
+                                        probe_semaphore=probe_semaphore,
+                                    )
                         except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            pass
-                    if pause_wait:
-                        await pause_wait()
-                    handle_result(cate, name, info, result)
+                            task = asyncio.current_task()
+                            if task is not None and task.cancelling():
+                                raise
+                            result = {
+                                "speed": 0,
+                                "delay": -1,
+                                "resolution": None,
+                                "fps": None,
+                                "video_codec": None,
+                                "audio_codec": None,
+                                "test_status": "request_error",
+                                "error_type": "CancelledError",
+                            }
+                        except TimeoutError:
+                            result = {
+                                "speed": 0,
+                                "delay": -1,
+                                "resolution": None,
+                                "fps": None,
+                                "video_codec": None,
+                                "audio_codec": None,
+                                "test_status": "timeout",
+                            }
+                        except Exception as exc:
+                            result = {
+                                "speed": 0,
+                                "delay": -1,
+                                "resolution": None,
+                                "fps": None,
+                                "video_codec": None,
+                                "audio_codec": None,
+                                "test_status": "request_error",
+                                "error_type": type(exc).__name__,
+                            }
+                        speed_value = result.get("speed") or 0
+                        delay_value = result.get("delay")
+                        if (
+                            capture_screenshots
+                            and delay_value not in {-1, None}
+                            and isinstance(speed_value, (int, float))
+                            and speed_value >= screenshot_speed_threshold
+                            and not math.isinf(speed_value)
+                        ):
+                            result_key = info.get("id") or stable_result_id(
+                                info.get("url", ""),
+                                info.get("headers"),
+                            )
+                            try:
+                                async with screenshot_semaphore:
+                                    screenshot = await capture_stream_screenshot(
+                                        info.get("url", "").partition("$")[0],
+                                        result_key,
+                                        constants.screenshot_dir,
+                                        headers={
+                                            **request_headers,
+                                            **(info.get("headers") or {}),
+                                        },
+                                        timeout=config.stream_screenshot_timeout,
+                                        width=config.stream_screenshot_width,
+                                    )
+                                await asyncio.to_thread(
+                                    upsert_stream_screenshot,
+                                    constants.channel_results_path,
+                                    screenshot,
+                                )
+                                if screenshot.get("status") == "success":
+                                    for key in (
+                                        "resolution",
+                                        "fps",
+                                        "video_codec",
+                                        "audio_codec",
+                                    ):
+                                        if screenshot.get(key) is not None:
+                                            result[key] = screenshot[key]
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                pass
+                        if pause_wait:
+                            await pause_wait()
+                        handle_result(cate, name, info, result)
 
             workers = [
                 asyncio.create_task(worker())
-                for _ in range(min(concurrency, total_tasks))
+                for _ in range(min(concurrency, len(lane_queue)))
             ]
             if workers:
                 await asyncio.gather(*workers)

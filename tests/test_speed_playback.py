@@ -5,7 +5,7 @@ from unittest.mock import PropertyMock, patch
 
 from utils.channel_quality import channel_result_rejection, is_channel_result_valid
 from utils.config import config
-from utils.speed import get_avg_result, get_result
+from utils.speed import get_avg_result, get_live_edge_span, get_result
 
 
 class HlsFixture:
@@ -260,6 +260,31 @@ class HlsPlaybackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["playback_checked"])
         self.assertNotIn("live_edge", result)
+
+    async def test_live_edge_waits_for_a_full_playlist_update_cycle(self):
+        # A real live playlist only shifts once per target duration, so an
+        # observation window shorter than that reports working streams as
+        # stalled.
+        fixture = await self.start_fixture(
+            target_duration=10.0,
+            segment_seconds=10.0,
+            advance=10.0,
+        )
+
+        with playback_config():
+            result = await get_result(fixture.url(), filter_resolution=False, timeout=20)
+
+        self.assertEqual(result["live_edge"], "advanced")
+        self.assertTrue(is_channel_result_valid(
+            result,
+            filter_speed=False,
+            filter_resolution=False,
+        ))
+
+    async def test_live_edge_span_covers_one_playlist_update(self):
+        self.assertGreaterEqual(get_live_edge_span(10.0), 12.5)
+        self.assertGreaterEqual(get_live_edge_span(2.0), 3.0)
+        self.assertEqual(get_live_edge_span(0), 0.0)
 
     async def test_playback_check_can_be_disabled(self):
         fixture = await self.start_fixture(advance=0.4)

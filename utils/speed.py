@@ -6,7 +6,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from time import time
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 import m3u8
@@ -51,8 +51,8 @@ stream_sample_max_bytes = 4 * 1024 * 1024
 stream_sample_max_seconds = 2.0
 playback_segment_limit = 2
 playback_segment_max_bytes = 64 * 1024 * 1024
-playback_edge_max_wait = 8.5
-playback_edge_wait_ratio = 0.8
+playback_edge_min_slack = 1.0
+playback_edge_slack_ratio = 0.25
 playback_timeout_reserve_ratio = 0.1
 
 ad_filter_keywords = [
@@ -71,6 +71,22 @@ ad_filter_keywords = [
     "/ads/",
 ]
 ad_max_loop_duration = 90
+
+
+def get_live_edge_span(target_duration: float) -> float:
+    """Time a live playlist needs to prove it advances, covering one full update window."""
+    target = max(0.0, float(target_duration or 0))
+    if target <= 0:
+        return 0.0
+    return target + max(playback_edge_min_slack, target * playback_edge_slack_ratio)
+
+
+def get_url_origin(url: str) -> str:
+    """Return the lower-cased host:port that serves a URL."""
+    try:
+        return urlsplit(url).netloc.lower()
+    except ValueError:
+        return ""
 
 
 def _is_aiohttp_dns_shield_error(context: dict) -> bool:
@@ -339,6 +355,33 @@ async def get_url_content(url: str, headers: dict = None, session: Any = None,
     return content
 
 
+async def resolve_origin(url: str, headers: dict = None, session: Any = None,
+                         timeout: float = 1.0, semaphore=None,
+                         redirects_remaining: int = 5) -> str:
+    """
+    Resolve the origin that ultimately serves a channel URL.
+
+    Redirecting entries make unrelated channel URLs share one media origin, so
+    the result is used to group candidates that would compete for the same
+    upstream. Failures fall back to the URL's own origin.
+    """
+    current = quote(url.partition('$')[0], safe=':/?$&=@[]%')
+    resolved = get_url_origin(current)
+    if not current:
+        return resolved
+    async with _session(session) as active_session:
+        for _ in range(max(0, redirects_remaining) + 1):
+            res_headers = await get_headers(
+                current, headers, active_session, timeout=timeout, semaphore=semaphore
+            )
+            target = res_headers.get('Location') if res_headers else None
+            if not target:
+                break
+            current = urljoin(current, target)
+            resolved = get_url_origin(current) or resolved
+    return resolved
+
+
 def check_m3u8_valid(headers: dict) -> bool:
     """
     Check if the m3u8 url is valid
@@ -431,22 +474,15 @@ async def _check_live_edge(playlist_url: str, initial_playlist, headers: dict,
     )
     if target_duration <= 0:
         return {}
-    elapsed_before = max(0.0, time() - playlist_fetched_at)
-    required_span = target_duration * playback_edge_wait_ratio
-    available = _remaining(deadline) - 0.5
-    if elapsed_before < required_span and available < max(0.5, required_span - elapsed_before):
+    required_span = get_live_edge_span(target_duration)
+    span_end = playlist_fetched_at + required_span
+    if span_end - time() > _remaining(deadline) - 0.5:
         return {'live_edge': 'unknown'}
-    max_wait = min(
-        max(0.0, target_duration + 0.5 - elapsed_before),
-        playback_edge_max_wait,
-        max(0.0, available),
-    )
     poll_interval = min(2.0, max(0.25, target_duration / 3.0))
-    start_time = time()
     refreshed = False
-    for _ in range(6):
+    while True:
         if _remaining(deadline) <= 0.3:
-            break
+            return {'live_edge': 'unknown'}
         content = await get_url_content(
             playlist_url,
             headers,
@@ -477,15 +513,13 @@ async def _check_live_edge(playlist_url: str, initial_playlist, headers: dict,
                     )
                     result['newest_segment_ok'] = bool(probe.get('size'))
                 return result
-        elapsed = time() - start_time
-        if elapsed >= max_wait:
+        now = time()
+        if now >= span_end:
             break
-        await asyncio.sleep(min(poll_interval, max_wait - elapsed))
+        await asyncio.sleep(min(poll_interval, span_end - now))
     if not refreshed:
         return {'live_edge': 'unknown'}
-    if elapsed_before + (time() - start_time) >= required_span:
-        return {'live_edge': 'stalled'}
-    return {'live_edge': 'unknown'}
+    return {'live_edge': 'stalled'}
 
 
 async def _measure_playlist_playback(playlist_url: str, playlist, headers: dict,

@@ -1,6 +1,7 @@
+import socket
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from utils.requests.async_tools import check_ipv6_support_async, fetch_first
 
@@ -32,24 +33,33 @@ class AsyncRequestTests(unittest.IsolatedAsyncioTestCase):
             "http://proxy.example.com:7890",
         )
 
-    async def test_ipv6_check_does_not_use_configured_or_environment_proxy(self):
-        response = AsyncMock(status=200)
-        response.__aenter__.return_value = response
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.get.return_value = response
+    async def test_ipv6_check_probes_ipv6_family_without_http_or_proxy(self):
+        calls = []
+
+        async def fake_open_connection(host, port, family=None):
+            calls.append((host, port, family))
+            writer = Mock()
+            writer.wait_closed = AsyncMock()
+            return Mock(), writer
 
         with patch(
-            "utils.requests.async_tools.config",
-            SimpleNamespace(http_proxy="http://proxy.example.com:7890"),
-        ), patch(
-            "utils.requests.async_tools.ClientSession",
-            return_value=session,
-        ) as client_session:
+            "utils.requests.async_tools.asyncio.open_connection",
+            new=fake_open_connection,
+        ):
             self.assertTrue(await check_ipv6_support_async())
 
-        client_session.assert_called_once_with(trust_env=False)
-        self.assertNotIn("proxy", session.get.call_args.kwargs)
+        self.assertTrue(calls)
+        self.assertTrue(all(family == socket.AF_INET6 for _, _, family in calls))
+
+    async def test_ipv6_check_returns_false_when_every_probe_fails(self):
+        async def fake_open_connection(host, port, family=None):
+            raise OSError("network is unreachable")
+
+        with patch(
+            "utils.requests.async_tools.asyncio.open_connection",
+            new=fake_open_connection,
+        ):
+            self.assertFalse(await check_ipv6_support_async())
 
     async def test_retry_failure_preserves_root_cause_in_message(self):
         session = Mock()

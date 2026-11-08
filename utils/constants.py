@@ -110,4 +110,14 @@ origin_map = {
 
 ipv6_proxy = "http://www.ipv6proxy.net/go.php?u="
 
+# IPv6 出口探测目标，使用 TCP 握手判断，避免站点返回 403/404 或封锁 UA 造成误判；
+# 最后一项为纯字面量地址，不依赖 DNS 解析
+ipv6_probe_targets = (
+    ("ipv6.baidu.com", 443),
+    ("www.taobao.com", 443),
+    ("ipv6.ustc.edu.cn", 80),
+    ("2400:3200::1", 53),
+)
+ipv6_probe_timeout = 3
+
 waiting_tip = t("msg.waiting_tip")

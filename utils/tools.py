@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
 from collections import defaultdict
@@ -303,15 +304,14 @@ def check_ipv6_support():
     """
     if os.getenv("GITHUB_ACTIONS"):
         return False
-    url = "https://ipv6.tokyo.test-ipv6.com/ip/?callback=?&testdomain=test-ipv6.com&testname=test_aaaa"
-    try:
-        print(t("msg.check_ipv6_support"))
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            print(t("msg.ipv6_supported"))
-            return True
-    except Exception:
-        pass
+    print(t("msg.check_ipv6_support"))
+    for host, port in constants.ipv6_probe_targets:
+        try:
+            with socket.create_connection((host, port), timeout=constants.ipv6_probe_timeout):
+                print(t("msg.ipv6_supported"))
+                return True
+        except OSError:
+            continue
     print(t("msg.ipv6_not_supported"))
     return False
 

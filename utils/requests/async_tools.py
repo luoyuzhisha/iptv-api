@@ -1,9 +1,11 @@
 import asyncio
+import socket
 import ssl
 
 import certifi
 from aiohttp import ClientSession, ClientTimeout
 
+import utils.constants as constants
 from utils.config import config
 from utils.i18n import t
 from utils.requests.tools import headers as default_headers
@@ -81,30 +83,41 @@ async def fetch_first(
 
 
 async def check_ipv6_support_async(reporter=None):
-    url = "https://ipv6.tokyo.test-ipv6.com/ip/?callback=?&testdomain=test-ipv6.com&testname=test_aaaa"
     if reporter:
         reporter.info("network.ipv6.checking", t("msg.check_ipv6_support"), phase="prepare")
     else:
         print(t("msg.check_ipv6_support"))
-    try:
-        async with ClientSession(trust_env=False) as session:
-            async with session.get(
-                    url,
-                    ssl=SSL_CONTEXT,
-                    timeout=ClientTimeout(total=10),
-            ) as response:
-                if response.status == 200:
-                    if reporter:
-                        reporter.info("network.ipv6.supported", t("msg.ipv6_supported"), phase="prepare")
-                    else:
-                        print(t("msg.ipv6_supported"))
-                    return True
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        pass
+    probes = await asyncio.gather(
+        *(
+            is_ipv6_reachable(host, port, constants.ipv6_probe_timeout)
+            for host, port in constants.ipv6_probe_targets
+        )
+    )
+    if any(probes):
+        if reporter:
+            reporter.info("network.ipv6.supported", t("msg.ipv6_supported"), phase="prepare")
+        else:
+            print(t("msg.ipv6_supported"))
+        return True
     if reporter:
         reporter.warning("network.ipv6.unsupported", t("msg.ipv6_not_supported"), phase="prepare")
     else:
         print(t("msg.ipv6_not_supported"))
     return False
+
+
+async def is_ipv6_reachable(host: str, port: int, timeout: float) -> bool:
+    """
+    Check IPv6 egress with an IPv6-only TCP handshake.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            _, writer = await asyncio.open_connection(host, port, family=socket.AF_INET6)
+    except Exception:
+        return False
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+    return True
